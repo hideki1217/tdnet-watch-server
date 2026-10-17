@@ -11,3 +11,10 @@
     uv run tdnet_move_into_the_black.py --once     # 1回だけ実行
     uv run tdnet_move_into_the_black.py --date 20260515 --once   # 指定日を処理
     ```
+
+    Docker Compose でも起動できる(`.env` の `TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL` を読み込み、`.cache` を永続化):
+
+    ```sh
+    docker compose up -d --build
+    docker compose logs -f
+    ```

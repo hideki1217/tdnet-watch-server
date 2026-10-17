@@ -1,0 +1,8 @@
+services:
+  tdnet-move-into-the-black:
+    build: .
+    restart: unless-stopped
+    environment:
+      TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL: ${TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL:-}
+    volumes:
+      - ./.cache:/app/.cache
