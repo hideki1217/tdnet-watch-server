@@ -122,7 +122,32 @@ def fetch_disclosures(date: str | None = None) -> list[dict]:
         f"{API_BASE}/{name}", params={"limit": 1000}, headers=HEADERS, timeout=30
     )
     r.raise_for_status()
-    return [item["Tdnet"] for item in r.json().get("items", [])]
+    try:
+        payload = r.json()
+    except ValueError as e:
+        # 不正な日付指定などでAPIが "Invalid Request" を返すことがある
+        raise RuntimeError(
+            f"TDnet APIがJSONを返しませんでした: {r.text[:200]!r}"
+        ) from e
+    if not isinstance(payload, dict):
+        raise TypeError(f"TDnet APIの応答形式が不正です: {type(payload).__name__}")
+
+    records = []
+    for item in payload.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        # 通常は {"Tdnet": {...}}。json2形式(ラッパーなし)や
+        # 大文字小文字違い(TDnet)でも壊れないようにする。
+        wrapped = next(
+            (
+                v
+                for k, v in item.items()
+                if k.lower() == "tdnet" and isinstance(v, dict)
+            ),
+            None,
+        )
+        records.append(wrapped if wrapped is not None else item)
+    return records
 
 
 def is_earnings_release(title: str) -> bool:
@@ -383,8 +408,8 @@ def main() -> None:
         try:
             n = run_once(con, args.date, args.verbose)
             print(f"[{now}] チェック完了(黒字転換 {n} 件)")
-        except requests.RequestException as e:
-            print(f"[{now}] [warn] 取得失敗: {e}")
+        except Exception as e:  # 一時的なAPI異常などで常駐が落ちないように
+            print(f"[{now}] [warn] 取得失敗: {type(e).__name__}: {e}")
         if args.once:
             break
         time.sleep(POLL_SECONDS)
