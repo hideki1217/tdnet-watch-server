@@ -15,7 +15,10 @@ TDnet(適時開示)を監視し、決算短信から「黒字転換」した会�
   python tdnet_turnaround.py --date 20260515 --once   # 指定日を処理
 
 環境変数(任意)。カレントディレクトリまたはスクリプトと同じ場所の .env があれば自動で読み込む:
-  TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL   Slack / Discord の Incoming Webhook URL。設定すると通知も送る
+  TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL   Slack / Discord の Incoming Webhook URL。黒字転換を通知する
+  TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_WEBHOOK_URL
+                                           起動・停止・ハートビートの通知先Webhook URL。
+                                           黒字転換とは別のWebhookを指定する。未設定なら送信しない
   TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_SECONDS
                                            稼働中であることをWebhookへ知らせる間隔(秒, 既定3600)。
                                            0以下で無効。黒字転換が0件でも送信する
@@ -48,6 +51,8 @@ POLL_SECONDS = 60
 MAX_BACKOFF_SECONDS = 1800
 MAX_PARSE_ATTEMPTS = 5
 HEARTBEAT_SECONDS = 3600
+WEBHOOK_ENV = "TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL"
+HEARTBEAT_WEBHOOK_ENV = "TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_WEBHOOK_URL"
 HEADERS = {"User-Agent": "tdnet-turnaround-monitor/0.1 (personal use)"}
 
 # 判定対象の利益項目(XBRLタグのローカル名 -> 表示名)
@@ -409,15 +414,16 @@ def format_report(ts: list[Turnaround]) -> str:
     return "\n".join(lines)
 
 
-def notify(text: str) -> None:
-    url = os.environ.get("TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL")
+def notify(text: str, env_var: str = WEBHOOK_ENV) -> None:
+    """env_var に設定されたWebhookへ送る。未設定なら何もしない。"""
+    url = os.environ.get(env_var)
     if not url:
         return
     # Slack は "text"、Discord は "content" を使うので両方入れる
     try:
         requests.post(url, json={"text": text, "content": text}, timeout=10)
     except requests.RequestException as e:
-        log.warning("通知失敗: %s: %s", type(e).__name__, e)
+        log.warning("通知失敗(%s): %s: %s", env_var, type(e).__name__, e)
 
 
 # ---------------------------------------------------------------- メイン処理
@@ -685,17 +691,20 @@ def main() -> None:
 
     con = init_db()
     log.info(
-        "監視を開始します: 間隔=%d秒 heartbeat=%s db=%s webhook=%s date=%s",
+        "監視を開始します: 間隔=%d秒 heartbeat=%s db=%s "
+        "webhook=%s heartbeat_webhook=%s date=%s",
         interval,
         f"{heartbeat_seconds}秒" if heartbeat_seconds > 0 else "無効",
         DB_PATH,
-        "設定あり"
-        if os.environ.get("TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL")
-        else "未設定",
+        "設定あり" if os.environ.get(WEBHOOK_ENV) else "未設定",
+        "設定あり" if os.environ.get(HEARTBEAT_WEBHOOK_ENV) else "未設定",
         args.date or "当日",
     )
     if not args.once:
-        notify(format_startup(interval, heartbeat_seconds, args.date))
+        notify(
+            format_startup(interval, heartbeat_seconds, args.date),
+            HEARTBEAT_WEBHOOK_ENV,
+        )
 
     started = time.monotonic()
     cycle = 0
@@ -750,7 +759,8 @@ def main() -> None:
                     last_result,
                     last_error,
                     consecutive_failures,
-                )
+                ),
+                HEARTBEAT_WEBHOOK_ENV,
             )
             last_heartbeat = time.monotonic()
 
@@ -767,7 +777,8 @@ def main() -> None:
         notify(
             format_shutdown(
                 int(time.monotonic() - started), cycle, stop_reason or "終了"
-            )
+            ),
+            HEARTBEAT_WEBHOOK_ENV,
         )
     con.close()
 
