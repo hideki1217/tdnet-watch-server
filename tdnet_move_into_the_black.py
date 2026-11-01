@@ -16,27 +16,34 @@ TDnet(適時開示)を監視し、決算短信から「黒字転換」した会�
 
 環境変数(任意)。カレントディレクトリまたはスクリプトと同じ場所の .env があれば自動で読み込む:
   TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL   Slack / Discord の Incoming Webhook URL。設定すると通知も送る
+  LOG_LEVEL                               ログ出力レベル(DEBUG / INFO / WARNING / ERROR, 既定 INFO)
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import logging
 import os
 import re
+import signal
 import sqlite3
+import sys
 import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_BASE = "https://webapi.yanoshin.jp/webapi/tdnet/list"
 DB_PATH = ".cache/tdnet_seen.sqlite3"
 POLL_SECONDS = 60
+MAX_BACKOFF_SECONDS = 1800
+MAX_PARSE_ATTEMPTS = 5
 HEADERS = {"User-Agent": "tdnet-turnaround-monitor/0.1 (personal use)"}
 
 # 判定対象の利益項目(XBRLタグのローカル名 -> 表示名)
@@ -55,6 +62,10 @@ CTX_RE = re.compile(
     r"(?:_(NonConsolidated|Consolidated)Member)?_ResultMember$"
 )
 
+log = logging.getLogger("tdnet")
+
+_session: requests.Session | None = None
+
 
 @dataclass
 class Turnaround:
@@ -66,6 +77,36 @@ class Turnaround:
     metric: str
     prior: float  # 百万円
     current: float  # 百万円
+
+
+# ---------------------------------------------------------------- HTTP
+def get_session() -> requests.Session:
+    """接続を使い回し、一時的な通信失敗を自動リトライするセッション。"""
+    global _session
+    if _session is None:
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update(HEADERS)
+        _session = session
+    return _session
+
+
+def _describe_response(resp: requests.Response | None) -> str:
+    if resp is None:
+        return "応答なし"
+    return f"HTTP {resp.status_code} {resp.url}"
 
 
 # ---------------------------------------------------------------- .env
@@ -98,8 +139,15 @@ def load_dotenv() -> None:
 # ---------------------------------------------------------------- DB
 def init_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     con.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY)")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS failures ("
+        "id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)"
+    )
+    con.commit()
     return con
 
 
@@ -110,31 +158,62 @@ def is_seen(con: sqlite3.Connection, doc_id: str) -> bool:
 
 
 def mark_seen(con: sqlite3.Connection, doc_id: str) -> None:
-    con.execute("INSERT OR IGNORE INTO seen VALUES (?)", (doc_id,))
-    con.commit()
+    with con:
+        con.execute("INSERT OR IGNORE INTO seen VALUES (?)", (doc_id,))
+        con.execute("DELETE FROM failures WHERE id=?", (doc_id,))
+
+
+def bump_failure(con: sqlite3.Connection, doc_id: str) -> int:
+    """解析失敗回数を+1し、累計を返す。"""
+    with con:
+        con.execute(
+            "INSERT INTO failures(id, count) VALUES(?, 1) "
+            "ON CONFLICT(id) DO UPDATE SET count = count + 1",
+            (doc_id,),
+        )
+        row = con.execute("SELECT count FROM failures WHERE id=?", (doc_id,)).fetchone()
+    return int(row[0]) if row else 0
 
 
 # ---------------------------------------------------------------- TDnet取得
 def fetch_disclosures(date: str | None = None) -> list[dict]:
     """date: 'YYYYMMDD'。Noneなら当日分。"""
     name = f"{date}.json" if date else "today.json"
-    r = requests.get(
-        f"{API_BASE}/{name}", params={"limit": 1000}, headers=HEADERS, timeout=30
-    )
+    url = f"{API_BASE}/{name}"
+    r = get_session().get(url, params={"limit": 1000}, timeout=30)
     r.raise_for_status()
     try:
         payload = r.json()
     except ValueError as e:
         # 不正な日付指定などでAPIが "Invalid Request" を返すことがある
+        log.error(
+            "TDnet APIがJSONを返しませんでした: %s content-type=%s body=%r",
+            _describe_response(r),
+            r.headers.get("content-type"),
+            r.text[:200],
+        )
         raise RuntimeError(
             f"TDnet APIがJSONを返しませんでした: {r.text[:200]!r}"
         ) from e
     if not isinstance(payload, dict):
         raise TypeError(f"TDnet APIの応答形式が不正です: {type(payload).__name__}")
 
+    items = payload.get("items")
+    if items is None:
+        items = []
+    if not isinstance(items, list):
+        log.error(
+            "TDnet APIのitemsが配列ではありません: type=%s keys=%s",
+            type(items).__name__,
+            list(payload),
+        )
+        raise TypeError(f"TDnet APIのitemsが配列ではありません: {type(items).__name__}")
+
     records = []
-    for item in payload.get("items") or []:
+    skipped = 0
+    for item in items:
         if not isinstance(item, dict):
+            skipped += 1
             continue
         # 通常は {"Tdnet": {...}}。json2形式(ラッパーなし)や
         # 大文字小文字違い(TDnet)でも壊れないようにする。
@@ -147,6 +226,14 @@ def fetch_disclosures(date: str | None = None) -> list[dict]:
             None,
         )
         records.append(wrapped if wrapped is not None else item)
+    if skipped:
+        log.warning("TDnet APIのitemsに想定外の要素が%d件ありました(スキップ)", skipped)
+    log.debug(
+        "TDnet API取得: %s 開示=%d件 (total_count=%s)",
+        url,
+        len(records),
+        payload.get("total_count"),
+    )
     return records
 
 
@@ -221,7 +308,7 @@ def find_turnarounds(item: dict) -> tuple[list[Turnaround], dict, bool]:
     xbrl_url = item.get("url_xbrl")
     if not xbrl_url:
         return [], {}, False
-    r = requests.get(xbrl_url, headers=HEADERS, timeout=60)
+    r = get_session().get(xbrl_url, timeout=60)
     r.raise_for_status()
     profits = extract_profits(r.content)
 
@@ -254,16 +341,16 @@ def debug_dump(date: str | None, code: str) -> None:
             item.get("title", "")
         ):
             continue
-        print(item.get("company_name"), "/", item.get("title"))
-        print("url_xbrl:", item.get("url_xbrl"))
+        log.info("%s / %s", item.get("company_name"), item.get("title"))
+        log.info("url_xbrl: %s", item.get("url_xbrl"))
         if not item.get("url_xbrl"):
             return
-        r = requests.get(item["url_xbrl"], headers=HEADERS, timeout=60)
+        r = get_session().get(item["url_xbrl"], timeout=60)
         r.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            print("--- zip内ファイル ---")
+            log.info("--- zip内ファイル ---")
             for n in zf.namelist():
-                print(n)
+                log.info("%s", n)
             ixbrl = sorted(
                 (n for n in zf.namelist() if n.lower().endswith("ixbrl.htm")),
                 key=lambda n: ("/summary/" not in n.lower(), n),
@@ -271,16 +358,16 @@ def debug_dump(date: str | None, code: str) -> None:
             for n in ixbrl[:2]:
                 soup = BeautifulSoup(zf.read(n), "html.parser")
                 seen: set = set()
-                print(f"--- {n} : ix:nonFraction (name, contextRef) 先頭40種 ---")
+                log.info("--- %s : ix:nonFraction (name, contextRef) 先頭40種 ---", n)
                 for tag in soup.find_all("ix:nonfraction"):
                     key = (tag.get("name"), tag.get("contextref"))
                     if key not in seen:
                         seen.add(key)
-                        print(key)
+                        log.info("%s", key)
                         if len(seen) >= 40:
                             break
         return
-    print("該当する決算短信が見つかりません")
+    log.info("該当する決算短信が見つかりません")
 
 
 # ---------------------------------------------------------------- 出力・通知
@@ -302,7 +389,7 @@ def notify(text: str) -> None:
     try:
         requests.post(url, json={"text": text, "content": text}, timeout=10)
     except requests.RequestException as e:
-        print(f"[warn] 通知失敗: {e}")
+        log.warning("通知失敗: %s: %s", type(e).__name__, e)
 
 
 # ---------------------------------------------------------------- メイン処理
@@ -318,15 +405,21 @@ def run_once(
         "no_xbrl": 0,
         "no_profit": 0,
         "parsed": 0,
+        "failed": 0,
     }
+    started = time.monotonic()
     for item in fetch_disclosures(date):
         stats["total"] += 1
-        doc_id = str(item.get("id"))
-        if not is_earnings_release(item.get("title", "")):
+        title = item.get("title") or ""
+        if not is_earnings_release(title):
             continue
         stats["earnings"] += 1
+        doc_id = str(item.get("id"))
+        code = str(item.get("company_code") or "")[:4]
+        name = item.get("company_name") or ""
         if is_seen(con, doc_id):
             stats["seen"] += 1
+            log.debug("処理済みのためスキップ: id=%s [%s] %s", doc_id, code, name)
             continue
         try:
             turnarounds, profits, has_xbrl = find_turnarounds(item)
@@ -335,11 +428,63 @@ def run_once(
                 # 保存期間切れ(TDnetは約1か月)など、再試行しても直らない失敗
                 mark_seen(con, doc_id)
                 expired += 1
+                log.info(
+                    "XBRLが404のため処理済みにします(保存期間切れの可能性): "
+                    "id=%s [%s] %s",
+                    doc_id,
+                    code,
+                    name,
+                )
             else:
-                print(f"[warn] {item.get('company_name')} の取得失敗: {e}")
+                stats["failed"] += 1
+                log.warning(
+                    "XBRL取得に失敗しました(次回再試行): id=%s [%s] %s %s",
+                    doc_id,
+                    code,
+                    name,
+                    _describe_response(e.response),
+                )
+            continue
+        except requests.RequestException as e:
+            # タイムアウト・DNS・接続断など。未処理のまま次回再試行する。
+            stats["failed"] += 1
+            log.warning(
+                "XBRL取得に失敗しました(通信エラー、次回再試行): id=%s [%s] %s %s: %s",
+                doc_id,
+                code,
+                name,
+                type(e).__name__,
+                e,
+            )
             continue
         except Exception as e:  # 1件の失敗で全体を止めない(未処理のまま次回再試行)
-            print(f"[warn] {item.get('company_name')} の解析失敗: {e}")
+            stats["failed"] += 1
+            attempts = bump_failure(con, doc_id)
+            if attempts >= MAX_PARSE_ATTEMPTS:
+                mark_seen(con, doc_id)
+                log.error(
+                    "解析に%d回失敗したため処理対象から除外します: "
+                    "id=%s [%s] %s %s: %s",
+                    attempts,
+                    doc_id,
+                    code,
+                    name,
+                    type(e).__name__,
+                    e,
+                    exc_info=log.isEnabledFor(logging.DEBUG),
+                )
+            else:
+                log.warning(
+                    "解析に失敗しました(%d/%d回目、次回再試行): id=%s [%s] %s %s: %s",
+                    attempts,
+                    MAX_PARSE_ATTEMPTS,
+                    doc_id,
+                    code,
+                    name,
+                    type(e).__name__,
+                    e,
+                    exc_info=log.isEnabledFor(logging.DEBUG),
+                )
             continue
         mark_seen(con, doc_id)
 
@@ -355,32 +500,63 @@ def run_once(
                 v = profits.get(local, {})
                 if "prior" in v and "current" in v:
                     parts.append(f"{label} {v['prior']:,.0f}→{v['current']:,.0f}")
-            print(
-                f"  [{item.get('company_code', '')[:4]}] {item.get('company_name')}: "
-                + " / ".join(parts)
-            )
+            log.info("  [%s] %s: %s", code, name, " / ".join(parts))
         elif verbose:
             reason = "XBRLなし" if not has_xbrl else "利益項目を読めず"
-            print(
-                f"  [{item.get('company_code', '')[:4]}] {item.get('company_name')}: {reason}"
-            )
+            log.info("  [%s] %s: %s", code, name, reason)
 
         if turnarounds:
             text = format_report(turnarounds)
-            print(text + "\n")
+            log.info("黒字転換を検出しました:\n%s", text)
             notify(text)
             count += len(turnarounds)
-    if verbose:
-        print(
-            f"[stats] 開示{stats['total']}件 / 決算短信{stats['earnings']}件"
-            f"(処理済みスキップ{stats['seen']}・XBRLなし{stats['no_xbrl']}"
-            f"・利益項目を読めず{stats['no_profit']}・解析成功{stats['parsed']})"
-        )
+    log.info(
+        "開示%d件 / 決算短信%d件 (処理済みスキップ%d・XBRLなし%d"
+        "・利益項目を読めず%d・解析成功%d・失敗%d) 所要%.1f秒",
+        stats["total"],
+        stats["earnings"],
+        stats["seen"],
+        stats["no_xbrl"],
+        stats["no_profit"],
+        stats["parsed"],
+        stats["failed"],
+        time.monotonic() - started,
+    )
     if expired:
-        print(
-            f"[info] {expired} 件はXBRLが404でした(保存期間切れの可能性。直近1か月以内の日付を指定してください)"
+        log.info(
+            "%d件はXBRLが404でした"
+            "(保存期間切れの可能性。直近1か月以内の日付を指定してください)",
+            expired,
         )
     return count
+
+
+def configure_logging(verbose: bool) -> None:
+    level_name = os.environ.get("LOG_LEVEL", "DEBUG" if verbose else "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+    # HTTPライブラリの内部ログは通常は抑制する
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def format_duration(seconds: int) -> str:
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, sec = divmod(rem, 60)
+    if days:
+        return f"{days}日{hours}時間{minutes}分"
+    if hours:
+        return f"{hours}時間{minutes}分"
+    return f"{minutes}分{sec}秒"
+
+
+def _raise_keyboard_interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
 
 
 def main() -> None:
@@ -394,25 +570,75 @@ def main() -> None:
         "--debug-code",
         help="証券コード4桁を指定し、その決算短信XBRLの中身を表示して終了",
     )
+    ap.add_argument(
+        "--interval",
+        type=int,
+        default=POLL_SECONDS,
+        help=f"常駐時の監視間隔(秒, 既定 {POLL_SECONDS})",
+    )
     args = ap.parse_args()
 
     load_dotenv()
+    configure_logging(args.verbose)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    interval = max(1, args.interval)
 
     if args.debug_code:
         debug_dump(args.date, args.debug_code)
         return
 
     con = init_db()
+    log.info(
+        "監視を開始します: 間隔=%d秒 db=%s webhook=%s date=%s",
+        interval,
+        DB_PATH,
+        "設定あり"
+        if os.environ.get("TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL")
+        else "未設定",
+        args.date or "当日",
+    )
+    started = time.monotonic()
+    cycle = 0
+    consecutive_failures = 0
     while True:
-        now = datetime.now().strftime("%H:%M:%S")
+        cycle += 1
         try:
             n = run_once(con, args.date, args.verbose)
-            print(f"[{now}] チェック完了(黒字転換 {n} 件)")
+        except KeyboardInterrupt:
+            log.info("停止しました(シグナル受信)")
+            break
         except Exception as e:  # 一時的なAPI異常などで常駐が落ちないように
-            print(f"[{now}] [warn] 取得失敗: {type(e).__name__}: {e}")
+            consecutive_failures += 1
+            exponent = min(consecutive_failures - 1, 6)
+            delay = min(interval * (2**exponent), MAX_BACKOFF_SECONDS)
+            log.exception(
+                "[cycle %d] 監視処理に失敗しました(%d回連続): %s "
+                "/ %.0f秒後に再試行します",
+                cycle,
+                consecutive_failures,
+                type(e).__name__,
+                delay,
+            )
+            if args.once:
+                raise
+        else:
+            consecutive_failures = 0
+            delay = interval
+            log.info(
+                "[cycle %d] チェック完了(黒字転換 %d件) / 連続稼働 %s",
+                cycle,
+                n,
+                format_duration(int(time.monotonic() - started)),
+            )
         if args.once:
             break
-        time.sleep(POLL_SECONDS)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            log.info("停止しました(シグナル受信)")
+            break
+    con.close()
 
 
 if __name__ == "__main__":
