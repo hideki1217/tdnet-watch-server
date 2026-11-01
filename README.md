@@ -4,7 +4,12 @@
     - TDnet(適時開示)を監視し、決算短信から「黒字転換」(前期 < 0 かつ 当期 > 0)した会社を列挙する
     - やのしんTDnet WebAPIから当日の開示一覧を取得し、添付XBRL(iXBRL)のサマリーから営業利益・経常利益・親会社株主に帰属する当期純利益を読む
     - 処理済みはSQLite(`.cache/tdnet_seen.sqlite3`)で管理し、重複通知を防ぐ
-    - 環境変数 `TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL` を設定すると Slack / Discord へ通知
+    - 環境変数 `TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL` を設定すると、黒字転換を Slack / Discord へ通知
+    - 環境変数 `TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_WEBHOOK_URL` を設定すると、起動・停止・ハートビートを**別の**Webhookへ通知する
+        - `TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_SECONDS`(既定3600秒)ごとに送信し、直近の黒字転換件数と開示件数の内訳を含める
+        - 通知が0件でも「黒字転換がなかった」のか「サーバーが止まっている」のかを判別できる
+        - ハートビートを無効にするには `TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_SECONDS=0` を指定する
+        - ハートビート用Webhookが未設定の場合、起動・停止・ハートビートは送信されない(黒字転換のWebhookには流れない)
     - 通信エラーは自動リトライし、連続失敗時は指数バックオフで間隔を空ける
     - 解析に繰り返し失敗する開示は5回で打ち切り、理由とIDをログに残す
     - ログは既定でINFO。`LOG_LEVEL=DEBUG` で各社の内訳やスタックトレースも出力する
@@ -16,7 +21,7 @@
     uv run tdnet_move_into_the_black.py --interval 300            # 監視間隔を変更
     ```
 
-    Docker Compose でも起動できる(`.env` の `TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL` を読み込み、`.cache` を永続化):
+    Docker Compose でも起動できる(`.env` の Webhook URL / ハートビート間隔を読み込み、`.cache` を永続化):
 
     ```sh
     docker compose up -d --build

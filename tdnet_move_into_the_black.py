@@ -15,7 +15,13 @@ TDnet(適時開示)を監視し、決算短信から「黒字転換」した会�
   python tdnet_turnaround.py --date 20260515 --once   # 指定日を処理
 
 環境変数(任意)。カレントディレクトリまたはスクリプトと同じ場所の .env があれば自動で読み込む:
-  TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL   Slack / Discord の Incoming Webhook URL。設定すると通知も送る
+  TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL   Slack / Discord の Incoming Webhook URL。黒字転換を通知する
+  TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_WEBHOOK_URL
+                                           起動・停止・ハートビートの通知先Webhook URL。
+                                           黒字転換とは別のWebhookを指定する。未設定なら送信しない
+  TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_SECONDS
+                                           稼働中であることをWebhookへ知らせる間隔(秒, 既定3600)。
+                                           0以下で無効。黒字転換が0件でも送信する
   LOG_LEVEL                               ログ出力レベル(DEBUG / INFO / WARNING / ERROR, 既定 INFO)
 """
 
@@ -44,6 +50,9 @@ DB_PATH = ".cache/tdnet_seen.sqlite3"
 POLL_SECONDS = 60
 MAX_BACKOFF_SECONDS = 1800
 MAX_PARSE_ATTEMPTS = 5
+HEARTBEAT_SECONDS = 3600
+WEBHOOK_ENV = "TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL"
+HEARTBEAT_WEBHOOK_ENV = "TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_WEBHOOK_URL"
 HEADERS = {"User-Agent": "tdnet-turnaround-monitor/0.1 (personal use)"}
 
 # 判定対象の利益項目(XBRLタグのローカル名 -> 表示名)
@@ -77,6 +86,30 @@ class Turnaround:
     metric: str
     prior: float  # 百万円
     current: float  # 百万円
+
+
+@dataclass
+class RunResult:
+    """1サイクル分の処理結果。ログとハートビート通知の両方で使う。"""
+
+    turnarounds: int
+    total: int
+    earnings: int
+    seen: int
+    no_xbrl: int
+    no_profit: int
+    parsed: int
+    failed: int
+    expired: int
+    elapsed: float
+
+    def summary(self) -> str:
+        return (
+            f"開示{self.total}件 / 決算短信{self.earnings}件 "
+            f"(処理済みスキップ{self.seen}・XBRLなし{self.no_xbrl}"
+            f"・利益項目を読めず{self.no_profit}・解析成功{self.parsed}"
+            f"・失敗{self.failed})"
+        )
 
 
 # ---------------------------------------------------------------- HTTP
@@ -381,21 +414,22 @@ def format_report(ts: list[Turnaround]) -> str:
     return "\n".join(lines)
 
 
-def notify(text: str) -> None:
-    url = os.environ.get("TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL")
+def notify(text: str, env_var: str = WEBHOOK_ENV) -> None:
+    """env_var に設定されたWebhookへ送る。未設定なら何もしない。"""
+    url = os.environ.get(env_var)
     if not url:
         return
     # Slack は "text"、Discord は "content" を使うので両方入れる
     try:
         requests.post(url, json={"text": text, "content": text}, timeout=10)
     except requests.RequestException as e:
-        log.warning("通知失敗: %s: %s", type(e).__name__, e)
+        log.warning("通知失敗(%s): %s: %s", env_var, type(e).__name__, e)
 
 
 # ---------------------------------------------------------------- メイン処理
 def run_once(
     con: sqlite3.Connection, date: str | None = None, verbose: bool = False
-) -> int:
+) -> RunResult:
     count = 0
     expired = 0
     stats = {
@@ -510,25 +544,26 @@ def run_once(
             log.info("黒字転換を検出しました:\n%s", text)
             notify(text)
             count += len(turnarounds)
-    log.info(
-        "開示%d件 / 決算短信%d件 (処理済みスキップ%d・XBRLなし%d"
-        "・利益項目を読めず%d・解析成功%d・失敗%d) 所要%.1f秒",
-        stats["total"],
-        stats["earnings"],
-        stats["seen"],
-        stats["no_xbrl"],
-        stats["no_profit"],
-        stats["parsed"],
-        stats["failed"],
-        time.monotonic() - started,
+    result = RunResult(
+        turnarounds=count,
+        total=stats["total"],
+        earnings=stats["earnings"],
+        seen=stats["seen"],
+        no_xbrl=stats["no_xbrl"],
+        no_profit=stats["no_profit"],
+        parsed=stats["parsed"],
+        failed=stats["failed"],
+        expired=expired,
+        elapsed=time.monotonic() - started,
     )
+    log.info("%s 所要%.1f秒", result.summary(), result.elapsed)
     if expired:
         log.info(
             "%d件はXBRLが404でした"
             "(保存期間切れの可能性。直近1か月以内の日付を指定してください)",
             expired,
         )
-    return count
+    return result
 
 
 def configure_logging(verbose: bool) -> None:
@@ -553,6 +588,68 @@ def format_duration(seconds: int) -> str:
     if hours:
         return f"{hours}時間{minutes}分"
     return f"{minutes}分{sec}秒"
+
+
+def format_startup(interval: int, heartbeat_seconds: int, date: str | None) -> str:
+    heartbeat = (
+        f"{format_duration(heartbeat_seconds)}ごと" if heartbeat_seconds > 0 else "無効"
+    )
+    return "\n".join(
+        [
+            "【起動】TDnet監視サーバーを起動しました",
+            f"  監視間隔: {interval}秒",
+            f"  ハートビート: {heartbeat}",
+            f"  対象日: {date or '当日'}",
+        ]
+    )
+
+
+def format_heartbeat(
+    cycle: int,
+    uptime: int,
+    result: RunResult | None,
+    last_error: str | None,
+    consecutive_failures: int,
+) -> str:
+    lines = [
+        "【稼働中】TDnet監視サーバーは動作しています",
+        f"  最終チェック: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if last_error:
+        lines.append(
+            f"  直近のチェック: 失敗({consecutive_failures}回連続) {last_error}"
+        )
+    elif result is not None:
+        lines.append(f"  直近の黒字転換: {result.turnarounds}件")
+        lines.append(f"  {result.summary()}")
+        lines.append(f"  所要: {result.elapsed:.1f}秒")
+    else:
+        lines.append("  直近のチェック: まだ完了していません")
+    lines.append(f"  連続稼働: {format_duration(uptime)} (cycle {cycle})")
+    return "\n".join(lines)
+
+
+def format_shutdown(uptime: int, cycle: int, reason: str) -> str:
+    return "\n".join(
+        [
+            f"【停止】TDnet監視サーバーを停止しました({reason})",
+            f"  連続稼働: {format_duration(uptime)} (cycle {cycle})",
+            "  再起動されるまでハートビートは届きません",
+        ]
+    )
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(
+            "%s の値が数値ではありません(%r)。既定値%dを使います", name, raw, default
+        )
+        return default
 
 
 def _raise_keyboard_interrupt(signum, frame) -> None:
@@ -583,6 +680,10 @@ def main() -> None:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     interval = max(1, args.interval)
+    heartbeat_seconds = env_int(
+        "TDNET_MOVE_INTO_THE_BLACK_HEARTBEAT_SECONDS", HEARTBEAT_SECONDS
+    )
+    heartbeat_seconds = max(0, heartbeat_seconds)
 
     if args.debug_code:
         debug_dump(args.date, args.debug_code)
@@ -590,26 +691,39 @@ def main() -> None:
 
     con = init_db()
     log.info(
-        "監視を開始します: 間隔=%d秒 db=%s webhook=%s date=%s",
+        "監視を開始します: 間隔=%d秒 heartbeat=%s db=%s "
+        "webhook=%s heartbeat_webhook=%s date=%s",
         interval,
+        f"{heartbeat_seconds}秒" if heartbeat_seconds > 0 else "無効",
         DB_PATH,
-        "設定あり"
-        if os.environ.get("TDNET_MOVE_INTO_THE_BLACK_WEBHOOK_URL")
-        else "未設定",
+        "設定あり" if os.environ.get(WEBHOOK_ENV) else "未設定",
+        "設定あり" if os.environ.get(HEARTBEAT_WEBHOOK_ENV) else "未設定",
         args.date or "当日",
     )
+    if not args.once:
+        notify(
+            format_startup(interval, heartbeat_seconds, args.date),
+            HEARTBEAT_WEBHOOK_ENV,
+        )
+
     started = time.monotonic()
     cycle = 0
     consecutive_failures = 0
+    last_heartbeat = time.monotonic()
+    last_result: RunResult | None = None
+    last_error: str | None = None
+    stop_reason = ""
     while True:
         cycle += 1
         try:
-            n = run_once(con, args.date, args.verbose)
+            result = run_once(con, args.date, args.verbose)
         except KeyboardInterrupt:
+            stop_reason = "シグナル受信"
             log.info("停止しました(シグナル受信)")
             break
         except Exception as e:  # 一時的なAPI異常などで常駐が落ちないように
             consecutive_failures += 1
+            last_error = f"{type(e).__name__}: {e}"
             exponent = min(consecutive_failures - 1, 6)
             delay = min(interval * (2**exponent), MAX_BACKOFF_SECONDS)
             log.exception(
@@ -624,20 +738,48 @@ def main() -> None:
                 raise
         else:
             consecutive_failures = 0
+            last_result = result
+            last_error = None
             delay = interval
             log.info(
                 "[cycle %d] チェック完了(黒字転換 %d件) / 連続稼働 %s",
                 cycle,
-                n,
+                result.turnarounds,
                 format_duration(int(time.monotonic() - started)),
             )
+
+        if (
+            heartbeat_seconds > 0
+            and time.monotonic() - last_heartbeat >= heartbeat_seconds
+        ):
+            notify(
+                format_heartbeat(
+                    cycle,
+                    int(time.monotonic() - started),
+                    last_result,
+                    last_error,
+                    consecutive_failures,
+                ),
+                HEARTBEAT_WEBHOOK_ENV,
+            )
+            last_heartbeat = time.monotonic()
+
         if args.once:
             break
         try:
             time.sleep(delay)
         except KeyboardInterrupt:
+            stop_reason = "シグナル受信"
             log.info("停止しました(シグナル受信)")
             break
+
+    if not args.once:
+        notify(
+            format_shutdown(
+                int(time.monotonic() - started), cycle, stop_reason or "終了"
+            ),
+            HEARTBEAT_WEBHOOK_ENV,
+        )
     con.close()
 
 
